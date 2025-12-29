@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [ main ]
   pull_request:
+    branches: [ main ]
 
 jobs:
   lint-and-test:
@@ -11,12 +13,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-        cache: 'poetry'
-    
     - name: Install Poetry
       uses: snok/install-poetry@v1
       with:
@@ -24,15 +20,20 @@ jobs:
         virtualenvs-create: true
         virtualenvs-in-project: true
     
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        cache: 'poetry'
+    
     - name: Install dependencies
       run: poetry install --no-interaction
     
-    - name: Run ruff linter
-      run: poetry run ruff check src/
+    - name: Run ruff check
+      run: poetry run ruff check src/ scripts/
     
-    - name: Run ruff formatter check
-      run: poetry run ruff format --check src/
+    - name: Run ruff format check
+      run: poetry run ruff format --check src/ scripts/
     
-    - name: Run tests with pytest
+    - name: Run tests
       run: poetry run pytest tests/ -v
-
