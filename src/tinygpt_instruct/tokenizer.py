@@ -1,23 +1,151 @@
+import json
 import os
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
 
 import regex as re
+from tokenizers import Regex as HFRegex
+from tokenizers import Tokenizer as HFTokenizerBase
+from tokenizers import decoders, pre_tokenizers
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
 
-GPT2_SPLIT_PATTERN = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+GPT4_SPLIT_PATTERN = (
+    r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+)
+
+SPECIAL_TOKENS = [
+    "<|bos|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|assistant_start|>",
+    "<|assistant_end|>",
+    "<|system_start|>",
+    "<|system_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+]
 
 
-class Tokenizer:
+class TokenizerInterface(ABC):
+    """Интерфейс для BPE токенизаторов."""
+
+    special_tokens: dict[str, int]
+
+    @abstractmethod
+    def train(
+        self,
+        text_iterator: Iterator[str],
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        """Обучает токенизатор на итераторе текстов."""
+        ...
+
+    @abstractmethod
+    def encode(self, text: str) -> list[int]:
+        """Кодирует текст в список ID токенов."""
+        ...
+
+    @abstractmethod
+    def decode(self, ids: list[int]) -> str:
+        """Декодирует список ID токенов обратно в строку."""
+        ...
+
+    @abstractmethod
+    def save(self, model_folder_path: str) -> None:
+        """Сохраняет токенизатор в указанную папку."""
+        ...
+
+    @classmethod
+    @abstractmethod
+    def load(cls, model_path: str) -> "TokenizerInterface":
+        """Загружает токенизатор из файла."""
+        ...
+
+    def render_conversation(
+        self,
+        conversation: dict,
+        max_tokens: int = 2048,
+    ) -> tuple[list[int], list[int]]:
+        """Токенизирует диалог для instruction-tuning.
+
+        Args:
+            conversation: Словарь с ключом "messages".
+            max_tokens: Максимальное количество токенов.
+
+        Returns:
+            Кортеж (ids, mask), где mask=1 для токенов assistant.
+        """
+        ids: list[int] = []
+        mask: list[int] = []
+
+        messages = conversation.get("messages", [])
+        if not messages:
+            return ids, mask
+
+        def add_tokens(token_ids: int | list[int], mask_val: int) -> None:
+            nonlocal ids, mask
+            if isinstance(token_ids, int):
+                token_ids = [token_ids]
+            ids.extend(token_ids)
+            mask.extend([mask_val] * len(token_ids))
+
+        add_tokens(self.special_tokens["<|bos|>"], 0)
+
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+
+            if role == "system":
+                add_tokens(self.special_tokens["<|system_start|>"], 0)
+                add_tokens(self.encode(content), 0)
+                add_tokens(self.special_tokens["<|system_end|>"], 0)
+
+            elif role == "user":
+                add_tokens(self.special_tokens["<|user_start|>"], 0)
+                add_tokens(self.encode(content), 0)
+                add_tokens(self.special_tokens["<|user_end|>"], 0)
+
+            elif role == "assistant":
+                add_tokens(self.special_tokens["<|assistant_start|>"], 0)
+
+                if isinstance(content, str):
+                    add_tokens(self.encode(content), 1)
+                elif isinstance(content, list):
+                    for part in content:
+                        value_ids = self.encode(part["text"])
+                        if part["type"] == "text":
+                            add_tokens(value_ids, 1)
+                        elif part["type"] == "python":
+                            add_tokens(self.special_tokens["<|python_start|>"], 1)
+                            add_tokens(value_ids, 1)
+                            add_tokens(self.special_tokens["<|python_end|>"], 1)
+                        elif part["type"] == "python_output":
+                            add_tokens(self.special_tokens["<|output_start|>"], 0)
+                            add_tokens(value_ids, 0)
+                            add_tokens(self.special_tokens["<|output_end|>"], 0)
+
+                add_tokens(self.special_tokens["<|assistant_end|>"], 1)
+
+        return ids[:max_tokens], mask[:max_tokens]
+
+
+class Tokenizer(TokenizerInterface):
     """Byte-level BPE tokenizer with regex pre-tokenization"""
 
     def __init__(self, split_pattern: str | None = None):
         """Инициализирует токенизатор.
 
         Args:
-            split_pattern (str | None): Шаблон регулярного выражения для предварительного разбиения текста.
+            split_pattern: Шаблон регулярного выражения для предварительного разбиения текста.
         """
-        self.split_pattern: re.Pattern = re.compile(split_pattern or ".+")
-        self.special_tokens: dict[str, int] = {}
+        self.split_pattern: re.Pattern = re.compile(split_pattern or GPT4_SPLIT_PATTERN)
         self.merges: dict[tuple[int, int], int] = {}
         self.vocab: dict[int, bytes] = {}
+        self.special_tokens: dict[str, int] = {}
 
     def _build_vocab(self) -> dict[int, bytes]:
         """Собирает словарь токенов на основе выполненных объединений и спецтокенов.
@@ -79,13 +207,13 @@ class Tokenizer:
 
         return stats
 
-    def register_special_tokens(self, special_tokens: list[str]) -> None:
-        """Регистрирует новые специальные токены и назначает им ID.
+    def _register_special_tokens(self, special_tokens: list[str]) -> None:
+        """Регистрирует специальные токены и назначает им ID.
 
         Args:
-            special_tokens (list[str]): Список строк для регистрации в качестве спецтокенов.
+            special_tokens: Список строк для регистрации.
         """
-        idx = len(self.vocab)
+        idx = 256 + len(self.merges)
         for special_token in special_tokens:
             if special_token not in self.special_tokens:
                 self.special_tokens[special_token] = idx
@@ -93,41 +221,52 @@ class Tokenizer:
 
         self.vocab = self._build_vocab()
 
-    def train(self, text: str, vocab_size: int) -> None:
-        """Обучает токенизатор на заданном тексте до достижения указанного размера словаря.
+    def train(
+        self,
+        text_iterator: Iterator[str],
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        """Обучает токенизатор на итераторе текстов.
 
         Args:
-            text (str): Текст для обучения.
-            vocab_size (int): Целевой размер словаря (минимум 256).
+            text_iterator: Итератор строк для обучения.
+            vocab_size: Целевой размер словаря.
+            special_tokens: Список специальных токенов (по умолчанию SPECIAL_TOKENS).
 
         Raises:
-            ValueError: Если vocab_size меньше 256.
+            ValueError: Если vocab_size слишком мал.
         """
-        num_merges = vocab_size - 256
-        if num_merges < 0:
-            raise ValueError("Размер словаря должен быть не менее 256")
+        if special_tokens is None:
+            special_tokens = SPECIAL_TOKENS
 
-        chunks = re.findall(self.split_pattern, text)
-        ids = [list(chunk.encode("utf-8")) for chunk in chunks]
+        num_special = len(special_tokens)
+        num_merges = vocab_size - 256 - num_special
+        if num_merges < 0:
+            raise ValueError(f"Размер словаря должен быть не менее {256 + num_special}")
+
+        all_ids: list[list[int]] = []
+        for text in text_iterator:
+            chunks = re.findall(self.split_pattern, text)
+            for chunk in chunks:
+                all_ids.append(list(chunk.encode("utf-8")))
 
         merges = {}
-
         for _ in range(num_merges):
-            stats = {}
-            for chunk_ids in ids:
-                stats = self._get_stats(chunk_ids, stats)
+            stats: dict[tuple[int, int], int] = {}
+            for chunk_ids in all_ids:
+                self._get_stats(chunk_ids, stats)
 
             if not stats:
                 break
 
             best_pair = max(stats, key=lambda pair: stats[pair])
             idx = 256 + len(merges)
-            ids = [self._merge(chunk_ids, best_pair, idx) for chunk_ids in ids]
-
+            all_ids = [self._merge(chunk_ids, best_pair, idx) for chunk_ids in all_ids]
             merges[best_pair] = idx
 
         self.merges = merges
-        self.vocab = self._build_vocab()
+        self._register_special_tokens(special_tokens)
 
     def _encode_chunk(self, chunk: str) -> list[int]:
         """Кодирует отдельный чанк текста (без спецтокенов) в список ID.
@@ -193,54 +332,153 @@ class Tokenizer:
         return full_bytes.decode("utf-8", errors="replace")
 
     def save(self, model_folder_path: str) -> None:
-        """Сохраняет модель токенизатора в указанную папку.
+        """Сохраняет модель токенизатора в указанную папку в формате JSON.
 
         Args:
-            model_folder_path (str): Путь к папке, где будет создан файл tokenizer.model.
+            model_folder_path: Путь к папке, где будет создан файл tokenizer_bpe.json.
         """
-        if not os.path.exists(model_folder_path):
-            os.makedirs(model_folder_path)
+        os.makedirs(model_folder_path, exist_ok=True)
 
-        model_path = os.path.join(model_folder_path, "tokenizer.model")
+        data = {
+            "split_pattern": self.split_pattern.pattern,
+            "special_tokens": self.special_tokens,
+            "merges": [[p0, p1, idx] for (p0, p1), idx in self.merges.items()],
+        }
+
+        model_path = os.path.join(model_folder_path, "tokenizer_bpe.json")
         with open(model_path, "w", encoding="utf-8") as f:
-            f.write(f"{self.split_pattern.pattern}\n")
-            f.write(f"{len(self.special_tokens)}\n")
-            f.write(f"{len(self.merges)}\n")
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-            for special_token, idx in self.special_tokens.items():
-                f.write(f"{special_token} {idx}\n")
-
-            for (p0, p1), idx in self.merges.items():
-                f.write(f"{p0} {p1} {idx}\n")
-
-    def load(self, model_path: str) -> None:
-        """Загружает модель токенизатора из файла формата .model.
+    @classmethod
+    def load(cls, model_path: str) -> "Tokenizer":
+        """Загружает токенизатор из файла JSON.
 
         Args:
-            model_path (str): Полный путь к файлу модели.
+            model_path: Путь к файлу tokenizer_bpe.json или папке с ним.
 
-        Raises:
-            ValueError: Если путь не ведет к файлу формата .model.
+        Returns:
+            Загруженный экземпляр Tokenizer.
         """
-        if not model_path.endswith(".model"):
-            raise ValueError("Путь к модели должен вести к файлу формата .model")
+        if os.path.isdir(model_path):
+            model_path = os.path.join(model_path, "tokenizer_bpe.json")
 
         with open(model_path, encoding="utf-8") as f:
-            split_pattern = f.readline().strip()
-            num_special = int(f.readline().strip())
-            num_merges = int(f.readline().strip())
+            data = json.load(f)
 
-            special_tokens = {}
-            for _ in range(num_special):
-                token, idx = f.readline().strip().split()
-                special_tokens[token] = int(idx)
+        instance = cls()
+        instance.split_pattern = re.compile(data["split_pattern"])
+        instance.special_tokens = data["special_tokens"]
+        instance.merges = {(m[0], m[1]): m[2] for m in data["merges"]}
+        instance.vocab = instance._build_vocab()
+        return instance
 
-            merges = {}
-            for _ in range(num_merges):
-                p0, p1, idx = map(int, f.readline().strip().split())
-                merges[(p0, p1)] = idx
 
-            self.split_pattern = re.compile(split_pattern)
-            self.special_tokens = special_tokens
-            self.merges = merges
-            self.vocab = self._build_vocab()
+class HuggingFaceTokenizer(TokenizerInterface):
+    """Быстрый BPE токенизатор на основе HuggingFace Tokenizers."""
+
+    def __init__(self):
+        """Инициализирует пустой токенизатор."""
+        self._tokenizer: HFTokenizerBase | None = None
+        self.special_tokens: dict[str, int] = {}
+
+    def train(
+        self,
+        text_iterator: Iterator[str],
+        vocab_size: int,
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        """Обучает токенизатор на итераторе текстов.
+
+        Args:
+            text_iterator: Итератор строк для обучения.
+            vocab_size: Целевой размер словаря.
+            special_tokens: Список специальных токенов (по умолчанию SPECIAL_TOKENS).
+        """
+        if special_tokens is None:
+            special_tokens = SPECIAL_TOKENS
+
+        tokenizer = HFTokenizerBase(
+            BPE(
+                byte_fallback=True,
+                unk_token=None,
+                fuse_unk=False,
+            )
+        )
+        tokenizer.normalizer = None
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(
+                    pattern=HFRegex(GPT4_SPLIT_PATTERN),
+                    behavior="isolated",
+                    invert=False,
+                ),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        tokenizer.decoder = decoders.ByteLevel()
+        tokenizer.post_processor = None
+
+        trainer = BpeTrainer(
+            vocab_size=vocab_size,
+            show_progress=True,
+            min_frequency=0,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=special_tokens,
+        )
+        tokenizer.train_from_iterator(text_iterator, trainer)
+
+        self._tokenizer = tokenizer
+        self.special_tokens = {
+            token.content: token_id for token_id, token in tokenizer.get_added_tokens_decoder().items()
+        }
+
+    def encode(self, text: str) -> list[int]:
+        """Кодирует текст в список ID токенов.
+
+        Args:
+            text: Входной текст.
+
+        Returns:
+            Список ID токенов.
+        """
+        return self._tokenizer.encode(text, add_special_tokens=False).ids
+
+    def decode(self, ids: list[int]) -> str:
+        """Декодирует список ID токенов обратно в строку.
+
+        Args:
+            ids: Список ID токенов.
+
+        Returns:
+            Декодированная строка.
+        """
+        return self._tokenizer.decode(ids, skip_special_tokens=False)
+
+    def save(self, model_folder_path: str) -> None:
+        """Сохраняет токенизатор в указанную папку.
+
+        Args:
+            model_folder_path: Путь к папке для сохранения.
+        """
+        os.makedirs(model_folder_path, exist_ok=True)
+        tokenizer_path = os.path.join(model_folder_path, "tokenizer.json")
+        self._tokenizer.save(tokenizer_path)
+
+    @classmethod
+    def load(cls, model_path: str) -> "HuggingFaceTokenizer":
+        """Загружает токенизатор из файла.
+
+        Args:
+            model_path: Путь к файлу tokenizer.json или папке с ним.
+
+        Returns:
+            Загруженный экземпляр HuggingFaceTokenizer.
+        """
+        if os.path.isdir(model_path):
+            model_path = os.path.join(model_path, "tokenizer.json")
+        instance = cls()
+        instance._tokenizer = HFTokenizerBase.from_file(model_path)
+        instance.special_tokens = {
+            token.content: token_id for token_id, token in instance._tokenizer.get_added_tokens_decoder().items()
+        }
+        return instance
