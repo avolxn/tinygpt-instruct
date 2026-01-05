@@ -1,6 +1,7 @@
 import os
 from collections.abc import Iterator
 
+import torch
 from tokenizers import Regex as HFRegex
 from tokenizers import Tokenizer as HFTokenizerBase
 from tokenizers import decoders, pre_tokenizers
@@ -27,7 +28,7 @@ SPECIAL_TOKENS = [
 
 
 class Tokenizer:
-    """Быстрый BPE токенизатор на основе HuggingFace Tokenizers."""
+    """BPE токенизатор на основе HuggingFace Tokenizers."""
 
     def __init__(self):
         """Инициализирует пустой токенизатор."""
@@ -85,6 +86,45 @@ class Tokenizer:
             token.content: token_id for token_id, token in tokenizer.get_added_tokens_decoder().items()
         }
 
+    def get_vocab_size(self) -> int:
+        """Возвращает размер словаря токенизатора.
+
+        Returns:
+            Размер словаря.
+        """
+        return self._tokenizer.get_vocab_size()
+
+    def get_special_tokens(self) -> list[str]:
+        """Возвращает список содержимого специальных токенов.
+
+        Returns:
+            Список строк специальных токенов.
+        """
+        special_tokens_map = self._tokenizer.get_added_tokens_decoder()
+        return [token.content for token in special_tokens_map.values()]
+
+    def get_token_bytes(self) -> torch.Tensor:
+        """Генерирует тензор с длинами токенов в байтах.
+
+        Специальные токены получают длину 0. Это необходимо для расчета
+        метрики Bits Per Byte (BPB) при обучении.
+
+        Returns:
+            torch.Tensor: Тензор длин токенов (dtype=torch.int32).
+        """
+        vocab_size = self.get_vocab_size()
+        special_tokens = set(self.get_special_tokens())
+
+        all_indices = [[i] for i in range(vocab_size)]
+        all_tokens = self._tokenizer.decode_batch(all_indices, skip_special_tokens=False)
+
+        token_bytes = torch.zeros(vocab_size, dtype=torch.int32)
+        for token_id, token_str in enumerate(all_tokens):
+            if token_str not in special_tokens:
+                token_bytes[token_id] = len(token_str.encode("utf-8"))
+
+        return token_bytes
+
     def encode(self, text: str) -> list[int]:
         """Кодирует текст в список ID токенов.
 
@@ -108,7 +148,8 @@ class Tokenizer:
         return self._tokenizer.decode(ids, skip_special_tokens=False)
 
     def save(self, model_folder_path: str) -> None:
-        """Сохраняет токенизатор в указанную папку.
+        """Сохраняет токенизатор (tokenizer.json) в указанную папку.
+        Файл token_bytes.pt должен создаваться отдельно в скрипте обучения.
 
         Args:
             model_folder_path: Путь к папке для сохранения.
@@ -116,6 +157,7 @@ class Tokenizer:
         os.makedirs(model_folder_path, exist_ok=True)
         tokenizer_path = os.path.join(model_folder_path, "tokenizer.json")
         self._tokenizer.save(tokenizer_path)
+        print(f"Saved tokenizer to {tokenizer_path}")
 
     @classmethod
     def load(cls, model_path: str) -> "Tokenizer":
